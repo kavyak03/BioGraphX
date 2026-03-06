@@ -21,6 +21,7 @@ import os
 import sys
 from pathlib import Path
 import json
+import warnings
 
 import numpy as np
 
@@ -133,16 +134,23 @@ def covariates_to_numeric_for_ate(cov_df, names):
 
     if "age" in df.columns:
         s = pd.to_numeric(df["age"], errors="coerce")
-        mats.append(s.fillna(s.median()).to_numpy().reshape(-1, 1))
+        med = s.median()
+        if pd.isna(med):
+            med = 0.0
+        mats.append(s.fillna(med).to_numpy().reshape(-1, 1))
         out_names.append("age")
 
     if "gleason" in df.columns:
         s = pd.to_numeric(df["gleason"], errors="coerce")
-        mats.append(s.fillna(s.median()).to_numpy().reshape(-1, 1))
+        med = s.median()
+        if pd.isna(med):
+            med = 0.0
+        mats.append(s.fillna(med).to_numpy().reshape(-1, 1))
         out_names.append("gleason")
 
     if "stage" in df.columns:
-        st = df["stage"].astype(str).fillna("NA")
+        st = df["stage"].astype(str)
+        st = st.replace({"nan": "NA", "None": "NA", "": "NA"})
         d = pd.get_dummies(st, prefix="stage", dummy_na=False)
         mats.append(d.to_numpy().astype(float))
         out_names.extend(list(d.columns))
@@ -221,6 +229,7 @@ def _fit_naive_bayes_bn(X_disc: np.ndarray, y: np.ndarray, feat_idx: np.ndarray,
 
 
 def main() -> None:
+    warnings.filterwarnings("error", message="Mean of empty slice", category=RuntimeWarning)
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 

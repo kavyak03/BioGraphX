@@ -116,6 +116,121 @@ def _stage_to_ordinal(x: str) -> int:
     return 0
 
 
+"""GDC clinical covariate loader (TCGA PRAD) with robust sample alignment.
+
+This module is intentionally lightweight and defensive:
+  - Accepts TSV/CSV files OR a ZIP that contains a TSV/CSV.
+  - Detects TCGA sample/case identifier columns by content ("TCGA-").
+  - Extracts a small set of covariates (age, stage, gleason) if present.
+  - Aligns covariates to an array of TCGA expression sample IDs using 12-char case IDs.
+
+Output is a numeric numpy matrix Z (n_samples x k) and covariate names.
+"""
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import zipfile
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class ClinicalMap:
+    id_col: Optional[str] = None
+    age_col: Optional[str] = None
+    stage_col: Optional[str] = None
+    gleason_col: Optional[str] = None
+
+
+def _read_table(path: Path) -> pd.DataFrame:
+    """Read TSV/CSV with minimal guessing."""
+    # try TSV then CSV
+    try:
+        return pd.read_csv(path, sep="\t", low_memory=False)
+    except Exception:
+        return pd.read_csv(path, low_memory=False)
+
+
+def _load_gdc_table(clinical_file: str) -> pd.DataFrame:
+    p = Path(clinical_file)
+    if not p.exists():
+        raise FileNotFoundError(f"clinical_file not found: {p}")
+
+    if p.suffix.lower() == ".zip":
+        with zipfile.ZipFile(p, "r") as z:
+            # pick the first TSV/CSV-like file
+            members = [m for m in z.namelist() if m.lower().endswith((".tsv", ".txt", ".csv"))]
+            if not members:
+                # some GDC zips contain files without extensions; fall back to first file
+                members = z.namelist()
+            if not members:
+                raise RuntimeError("clinical ZIP is empty")
+            name = members[0]
+            with z.open(name) as f:
+                # try TSV then CSV
+                try:
+                    return pd.read_csv(f, sep="\t", low_memory=False)
+                except Exception:
+                    f.seek(0)
+                    return pd.read_csv(f, low_memory=False)
+
+    return _read_table(p)
+
+
+def _looks_like_tcga_id(x: str) -> bool:
+    return isinstance(x, str) and x.startswith("TCGA-") and len(x) >= 12
+
+
+def _detect_id_col(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        vals = df[c].dropna().astype(str).head(200).tolist()
+        if not vals:
+            continue
+        hits = sum(_looks_like_tcga_id(v) for v in vals)
+        if hits >= 5:
+            return c
+
+    # common GDC names
+    for c in ["submitter_id", "case_submitter_id", "bcr_patient_barcode", "sample", "case_id"]:
+        if c in df.columns:
+            return c
+    raise RuntimeError(f"Could not detect TCGA id column in clinical file. Columns: {list(df.columns)[:60]}")
+
+
+def _find_col(df: pd.DataFrame, override: Optional[str], candidates: List[str], substr: List[str]) -> Optional[str]:
+    if override and override in df.columns:
+        return override
+    lower = {c.lower(): c for c in df.columns}
+    for k in candidates:
+        if k.lower() in lower:
+            return lower[k.lower()]
+    for c in df.columns:
+        cl = c.lower()
+        if any(s in cl for s in substr):
+            return c
+    return None
+
+
+def _stage_to_ordinal(x: str) -> int:
+    if not isinstance(x, str):
+        return 0
+    s = x.upper().strip()
+    # normalize common prefixes
+    s = s.replace("STAGE", "").replace(" ", "")
+    # keep leading roman numeral group
+    if s.startswith("IV"):
+        return 4
+    if s.startswith("III"):
+        return 3
+    if s.startswith("II"):
+        return 2
+    if s.startswith("I"):
+        return 1
+    return 0
+
+
 def load_gdc_covariates_aligned(
     clinical_file: str,
     sample_ids: np.ndarray,
@@ -184,10 +299,29 @@ def load_gdc_covariates_aligned(
     aligned = cov.reindex(samp_12.values)
     matched = int(aligned.notna().any(axis=1).sum())
 
-    # Impute missing with median (per column) and ensure float
-    for c in names:
-        med = pd.to_numeric(aligned[c], errors="coerce").median()
-        aligned[c] = pd.to_numeric(aligned[c], errors="coerce").fillna(med)
+   # Keep only covariates that have at least one matched, non-missing value
+    kept_names: List[str] = []
 
-    Z = aligned[names].to_numpy(dtype=float)
-    return Z, names, f"Loaded covariates {names}; matched {matched}/{len(sample_ids)} samples (by 12-char case id)."
+    for c in names:
+        s = pd.to_numeric(aligned[c], errors="coerce")
+        non_missing = s.dropna()
+
+        # Drop covariate entirely if nothing matched
+        if non_missing.empty:
+            continue
+
+        med = float(non_missing.median())
+        aligned[c] = s.fillna(med)
+        kept_names.append(c)
+
+    if not kept_names:
+        return None, [], (
+            f"Detected candidate covariates {names}, but none had usable matched values "
+            f"after alignment to TCGA samples. matched {matched}/{len(sample_ids)} samples."
+        )
+
+    Z = aligned[kept_names].to_numpy(dtype=float)
+    return Z, kept_names, (
+        f"Loaded covariates {kept_names}; matched {matched}/{len(sample_ids)} samples "
+        f"(by 12-char case id)."
+    )
